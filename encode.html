@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Visual Noise Encoder</title>
+  <style>
+    :root { color-scheme: dark; font: 14px system-ui, sans-serif; background: #181818; color: #ddd; }
+    * { box-sizing: border-box; }
+    body { margin: 16px; }
+    .shell { max-width: 900px; margin: auto; }
+    h1 { margin: 0 0 12px; font-size: 22px; }
+    p { margin: 10px 0; line-height: 1.4; }
+    input, select, button { min-width: 0; padding: 4px 6px; border-radius: 0; font: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: default; }
+    .picker-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .drop { display: grid; gap: 4px; padding: 16px; border: 1px dashed #777; text-align: center; cursor: pointer; }
+    .drop.drag { outline: 2px solid; }
+    .actions { display: flex; justify-content: center; gap: 6px; margin-top: 6px; }
+    .settings { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-top: 14px; }
+    label { display: grid; gap: 4px; }
+    .phrase { flex: 1 1 200px; }
+    input[type="number"] { width: 130px; }
+    #status { min-height: 20px; }
+    .note, .count, .drop span { color: #aaa; }
+    .note { font-size: 12px; }
+    footer { margin-top: 24px; color: #aaa; }
+    @media (max-width: 480px) { .picker-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <h1>Encode images</h1>
+      <p>
+        The secret keeps its original size unless limited below. The cover is center-cropped
+        and scaled to exactly twice its width and height.
+      </p>
+    </header>
+
+    <section class="picker-grid" aria-label="Input images">
+      <div>
+        <div id="secret-drop" class="drop" role="button" tabindex="0">
+          <strong>Secret images</strong>
+          <span>Drop files or a folder</span>
+          <span id="secret-count" class="count">nothing selected</span>
+        </div>
+        <div class="actions">
+          <button id="secret-files" type="button">Choose files</button>
+          <button id="secret-folder" type="button">Choose folder</button>
+        </div>
+      </div>
+
+      <div>
+        <div id="cover-drop" class="drop" role="button" tabindex="0">
+          <strong>Cover images</strong>
+          <span>Covers repeat in filename order across secrets</span>
+          <span id="cover-count" class="count">nothing selected</span>
+        </div>
+        <div class="actions">
+          <button id="cover-files" type="button">Choose files</button>
+          <button id="cover-folder" type="button">Choose folder</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings" aria-label="Encoding settings">
+      <label class="phrase">Seed phrase
+        <input id="seed" autocomplete="off" spellcheck="false" placeholder="a long random phrase">
+      </label>
+      <label>First index
+        <input id="start" type="number" min="0" value="0">
+      </label>
+      <label>Maximum output side
+        <input id="max-side" type="number" min="2" step="1" placeholder="no limit">
+      </label>
+      <label>Save as
+        <select id="save-mode">
+          <option value="files">Separate PNG downloads</option>
+          <option value="folder">PNG files in a folder</option>
+          <option value="zip" selected>ZIP archive</option>
+        </select>
+      </label>
+      <button id="encode" type="button">Create PNG</button>
+    </section>
+
+    <p id="status" aria-live="polite">Choose secret and cover images.</p>
+    <p class="note">
+      The limit applies to the PNG container: before encoding, the secret is proportionally
+      reduced to half the specified side. Gallery indices increase by one for each file. Do not
+      reuse the same phrase and indices in another gallery: this is not a substitute for a unique nonce.
+    </p>
+    <p id="save-note" class="note"></p>
+    <footer>
+      © 2026 Keishin Senzaki (reordo) ·
+      <a href="mailto:riodaa@proton.me">riodaa@proton.me</a> ·
+      <a href="https://github.com/reordo">GitHub</a> ·
+      <a href="https://github.com/reordo/VisualNoiseDecoder">Repository</a>
+    </footer>
+  </main>
+
+  <input id="secret-input" type="file" accept="image/*" multiple hidden>
+  <input id="cover-input" type="file" accept="image/*" multiple hidden>
+
+  <script>
+    const DOMAIN = 'VND-MAIN-HALF-2LSB-MASK-RGB';
+    const secretFiles = [];
+    const coverFiles = [];
+    const $ = selector => document.querySelector(selector);
+    const status = $('#status');
+
+    function isImage(file) {
+      if (typeof file === 'string') {
+        return /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(file);
+      }
+      return file?.type?.startsWith('image/') || isImage(file?.name || '');
+    }
+
+    function updateCounts() {
+      const label = count => `${count} file${count === 1 ? '' : 's'}`;
+      $('#secret-count').textContent = label(secretFiles.length);
+      $('#cover-count').textContent = label(coverFiles.length);
+    }
+
+    function setFiles(target, files) {
+      const images = [...files]
+        .filter(isImage)
+        .sort((a, b) => (a.webkitRelativePath || a.name).localeCompare(b.webkitRelativePath || b.name));
+      target.splice(0, target.length, ...images);
+      updateCounts();
+    }
+
+    async function collectFiles(handle, files) {
+      if (handle.kind === 'file') {
+        const file = await handle.getFile();
+        if (isImage(file)) files.push(file);
+        return;
+      }
+      for await (const child of handle.values()) await collectFiles(child, files);
+    }
+
+    async function chooseFolder(target) {
+      if (!window.showDirectoryPicker) {
+        status.textContent = 'Folder selection is supported in Chromium; drop files in another browser.';
+        return;
+      }
+      try {
+        const files = [];
+        await collectFiles(await showDirectoryPicker(), files);
+        setFiles(target, files);
+      } catch (error) {
+        if (error.name !== 'AbortError') throw error;
+      }
+    }
+
+    async function handleDrop(event, target) {
+      event.preventDefault();
+      event.currentTarget.classList.remove('drag');
+      const droppedFiles = [...event.dataTransfer.files];
+      const fileItems = [...event.dataTransfer.items].filter(item => item.kind === 'file');
+      const handles = await Promise.all(fileItems.map(async item => {
+        try {
+          return await item.getAsFileSystemHandle?.() || null;
+        } catch {
+          return null;
+        }
+      }));
+
+      if (handles.length && handles.every(Boolean)) {
+        const files = [];
+        for (const handle of handles) await collectFiles(handle, files);
+        setFiles(target, files);
+      } else {
+        setFiles(target, droppedFiles);
+      }
+    }
+
+    function report(error) {
+      status.textContent = error.message || String(error);
+    }
+
+    function setupPicker(kind, target) {
+      const drop = $(`#${kind}-drop`);
+      const input = $(`#${kind}-input`);
+      const choose = () => {
+        input.value = '';
+        input.click();
+      };
+
+      drop.addEventListener('click', choose);
+      drop.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          choose();
+        }
+      });
+      for (const type of ['dragenter', 'dragover']) {
+        drop.addEventListener(type, event => {
+          event.preventDefault();
+          drop.classList.add('drag');
+        });
+      }
+      drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+      drop.addEventListener('drop', event => handleDrop(event, target).catch(report));
+      input.addEventListener('change', () => setFiles(target, input.files));
+      $(`#${kind}-files`).addEventListener('click', choose);
+      $(`#${kind}-folder`).addEventListener('click', () => chooseFolder(target).catch(report));
+    }
+
+    async function keyStream(phrase, index, size) {
+      const material = `${DOMAIN}\0${index}\0${phrase}`;
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(material));
+      const key = await crypto.subtle.importKey('raw', digest, { name: 'AES-CTR' }, false, ['encrypt']);
+      return new Uint8Array(await crypto.subtle.encrypt(
+        { name: 'AES-CTR', counter: new Uint8Array(16), length: 128 },
+        key,
+        new Uint8Array(size)
+      ));
+    }
+
+    function bit(data, index) {
+      return (data[index >> 3] & (1 << (7 - (index & 7)))) !== 0;
+    }
+
+    function createCanvas(width, height) {
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      return canvas;
+    }
+
+    function drawCover(source, width, height) {
+      const canvas = createCanvas(width, height);
+      const context = canvas.getContext('2d', { alpha: false });
+      const scale = Math.max(width / source.width, height / source.height);
+      const scaledWidth = source.width * scale;
+      const scaledHeight = source.height * scale;
+
+      context.imageSmoothingQuality = 'high';
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, width, height);
+      context.drawImage(source, (width - scaledWidth) / 2, (height - scaledHeight) / 2, scaledWidth, scaledHeight);
+      return context.getImageData(0, 0, width, height);
+    }
+
+    function drawSecret(source, width, height) {
+      const canvas = createCanvas(width, height);
+      const context = canvas.getContext('2d', { alpha: false });
+      context.imageSmoothingQuality = 'high';
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, width, height);
+      context.drawImage(source, 0, 0, width, height);
+      return context.getImageData(0, 0, width, height);
+    }
+
+    function canvasBlob(canvas) {
+      return new Promise((resolve, reject) => {
+        canvas.toBlob(blob => blob ? resolve(blob) : reject(Error('PNG was not created')), 'image/png');
+      });
+    }
+
+    async function encodeImage(secretFile, coverFile, phrase, index, maxSide) {
+      const [secretBitmap, coverBitmap] = await Promise.all([
+        createImageBitmap(secretFile),
+        createImageBitmap(coverFile)
+      ]);
+
+      try {
+        const largestSide = Math.max(secretBitmap.width, secretBitmap.height);
+        const scale = maxSide ? Math.min(1, Math.floor(maxSide / 2) / largestSide) : 1;
+        const width = Math.max(1, Math.floor(secretBitmap.width * scale));
+        const height = Math.max(1, Math.floor(secretBitmap.height * scale));
+        const secret = drawSecret(secretBitmap, width, height);
+        const cover = drawCover(coverBitmap, width * 2, height * 2);
+        const stream = await keyStream(phrase, index, width * height * 3);
+        let streamBit = 0;
+
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const secretOffset = (y * width + x) * 4;
+            for (let quadrant = 0; quadrant < 4; quadrant++) {
+              const outputOffset = (
+                (y + (quadrant >> 1) * height) * width * 2 +
+                x + (quadrant & 1) * width
+              ) * 4;
+              for (let channel = 0; channel < 3; channel++) {
+                const mask = Number(bit(stream, streamBit++)) |
+                  Number(bit(stream, streamBit++)) << 1;
+                const secretBits = (secret.data[secretOffset + channel] >> (quadrant * 2)) & 3;
+                cover.data[outputOffset + channel] =
+                  (cover.data[outputOffset + channel] & 252) | (secretBits ^ mask);
+              }
+            }
+          }
+        }
+
+        const output = createCanvas(width * 2, height * 2);
+        output.getContext('2d').putImageData(cover, 0, 0);
+        return await canvasBlob(output);
+      } finally {
+        secretBitmap.close();
+        coverBitmap.close();
+      }
+    }
+
+    function download(blob, name) {
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = name;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+
+    function zipRecord(size, signature) {
+      const record = new DataView(new ArrayBuffer(size));
+      record.setUint32(0, signature, true);
+      return record;
+    }
+
+    // Stored ZIP: PNG is already compressed. Only headers stay in memory when writing to disk.
+    class ZipWriter {
+      static crcTable = Uint32Array.from({ length: 256 }, (_, value) => {
+        for (let bit = 0; bit < 8; bit++) value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
+        return value;
+      });
+
+      constructor(sink) {
+        this.sink = sink;
+        this.parts = [];
+        this.entries = [];
+        this.offset = 0;
+      }
+
+      async write(data) {
+        const size = data.size ?? data.byteLength;
+        if (this.offset + size >= 0xffffffff) throw Error('ZIP must be smaller than 4 GiB. Use folder output for larger galleries.');
+        if (this.sink) await this.sink.write(data);
+        else this.parts.push(data);
+        this.offset += size;
+      }
+
+      async add(filename, blob) {
+        const name = new TextEncoder().encode(filename);
+        if (name.length > 65535 || this.entries.length >= 65534) throw Error('ZIP entry limit reached. Use folder output.');
+        const offset = this.offset;
+        const now = new Date();
+        const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+        const date = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+        const local = zipRecord(30, 0x04034b50);
+        local.setUint16(4, 20, true);
+        local.setUint16(6, 0x0808, true); // UTF-8 names, CRC and sizes follow the file data.
+        local.setUint16(10, time, true);
+        local.setUint16(12, date, true);
+        local.setUint16(26, name.length, true);
+        await this.write(local.buffer);
+        await this.write(name);
+
+        let crc = 0xffffffff;
+        const reader = blob.stream().getReader();
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            for (let i = 0; i < value.length; i++) crc = (crc >>> 8) ^ ZipWriter.crcTable[(crc ^ value[i]) & 255];
+            if (this.sink) await this.write(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        if (!this.sink) await this.write(blob);
+        crc = (crc ^ 0xffffffff) >>> 0;
+
+        const descriptor = zipRecord(16, 0x08074b50);
+        descriptor.setUint32(4, crc, true);
+        descriptor.setUint32(8, blob.size, true);
+        descriptor.setUint32(12, blob.size, true);
+        await this.write(descriptor.buffer);
+
+        const central = zipRecord(46 + name.length, 0x02014b50);
+        central.setUint16(4, 20, true);
+        central.setUint16(6, 20, true);
+        central.setUint16(8, 0x0808, true);
+        central.setUint16(12, time, true);
+        central.setUint16(14, date, true);
+        central.setUint32(16, crc, true);
+        central.setUint32(20, blob.size, true);
+        central.setUint32(24, blob.size, true);
+        central.setUint16(28, name.length, true);
+        central.setUint32(42, offset, true);
+        new Uint8Array(central.buffer, 46).set(name);
+        this.entries.push(central.buffer);
+      }
+
+      async close() {
+        const start = this.offset;
+        for (const entry of this.entries) await this.write(entry);
+        const end = zipRecord(22, 0x06054b50);
+        end.setUint16(8, this.entries.length, true);
+        end.setUint16(10, this.entries.length, true);
+        end.setUint32(12, this.offset - start, true);
+        end.setUint32(16, start, true);
+        await this.write(end.buffer);
+        if (this.sink) await this.sink.close();
+        else download(new Blob(this.parts, { type: 'application/zip' }), 'images.zip');
+      }
+    }
+
+    async function saveFile(handle, blob) {
+      const writable = await handle.createWritable();
+      try {
+        await writable.write(blob);
+        await writable.close();
+      } catch (error) {
+        await writable.abort().catch(() => {});
+        throw error;
+      }
+    }
+
+    const saveMode = $('#save-mode');
+    saveMode.querySelector('[value="folder"]').disabled = !window.showDirectoryPicker;
+    function updateSaveNote() {
+      const notes = {
+        files: 'Your browser may ask to allow multiple downloads.',
+        folder: 'Choose a destination folder when starting. Existing files with the same names are replaced.',
+        zip: window.showSaveFilePicker
+          ? 'ZIP is written directly to disk, without recompressing PNGs. Archive size limit: 4 GiB.'
+          : 'ZIP is collected before downloading. Size limit: 4 GiB; large galleries require enough browser memory.'
+      };
+      $('#save-note').textContent = notes[saveMode.value];
+    }
+    saveMode.addEventListener('change', updateSaveNote);
+    updateSaveNote();
+
+    $('#encode').addEventListener('click', async () => {
+      const button = $('#encode');
+      const phrase = $('#seed').value;
+      const firstIndexText = $('#start').value.trim();
+      const firstIndex = Number(firstIndexText);
+      const maxSideText = $('#max-side').value.trim();
+      const maxSide = maxSideText ? Number(maxSideText) : 0;
+
+      if (
+        !secretFiles.length ||
+        !coverFiles.length ||
+        !phrase ||
+        !firstIndexText ||
+        !Number.isSafeInteger(firstIndex) ||
+        firstIndex < 0 ||
+        !Number.isSafeInteger(firstIndex + secretFiles.length - 1) ||
+        !Number.isSafeInteger(maxSide) ||
+        maxSide < 0 ||
+        maxSide === 1
+      ) {
+        status.textContent = 'Check the secret, cover, phrase, index, and size limit.';
+        return;
+      }
+      const secrets = [...secretFiles];
+      const covers = [...coverFiles];
+      const mode = saveMode.value;
+      let directory;
+      let sink;
+      let zip;
+      button.disabled = true;
+      try {
+        if (mode === 'folder') {
+          directory = await showDirectoryPicker({ mode: 'readwrite' });
+        } else if (mode === 'zip') {
+          if (window.showSaveFilePicker) {
+            const handle = await showSaveFilePicker({
+              suggestedName: 'images.zip',
+              types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }]
+            });
+            sink = await handle.createWritable();
+          }
+          zip = new ZipWriter(sink);
+        }
+        for (let i = 0; i < secrets.length; i++) {
+          const index = firstIndex + i;
+          status.textContent = `Encoding ${i + 1}/${secrets.length}, index ${index}…`;
+          const blob = await encodeImage(secrets[i], covers[i % covers.length], phrase, index, maxSide);
+          const baseName = secrets[i].name.replace(/\.[^.]+$/, '');
+          const name = `${baseName}.vnd-${index}.png`;
+          if (directory) await saveFile(await directory.getFileHandle(name, { create: true }), blob);
+          else if (zip) await zip.add(name, blob);
+          else download(blob, name);
+        }
+        if (zip) await zip.close();
+        status.textContent = mode === 'files' ? 'Done. PNG downloads started.' : 'Done.';
+      } catch (error) {
+        if (sink) await sink.abort().catch(() => {});
+        if (error.name === 'AbortError') status.textContent = 'Cancelled.';
+        else report(error);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    setupPicker('secret', secretFiles);
+    setupPicker('cover', coverFiles);
+    updateCounts();
+  </script>
+</body>
+</html>

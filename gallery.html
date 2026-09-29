@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Visual Noise Gallery</title>
+  <style>
+    :root { color-scheme: dark; font: 14px system-ui, sans-serif; background: #181818; color: #ddd; }
+    * { box-sizing: border-box; }
+    body { margin: 16px; }
+    .shell { max-width: 1200px; margin: auto; }
+    h1 { margin: 0 0 12px; font-size: 22px; }
+    p { margin: 10px 0; line-height: 1.4; }
+    textarea, input, select, button { min-width: 0; padding: 4px 6px; border-radius: 0; font: inherit; }
+    textarea { width: 100%; min-height: 180px; resize: vertical; }
+    button { cursor: pointer; }
+    label { display: grid; gap: 4px; }
+    .form { display: grid; grid-template-columns: minmax(0, 1fr) 200px; gap: 12px; }
+    .form > label { grid-template-rows: auto 1fr; }
+    .side { display: grid; align-content: end; gap: 8px; }
+    .status:empty { display: none; }
+    .gallery { display: grid; gap: 16px; margin-top: 16px; }
+    .item { overflow: hidden; border: 1px solid #555; }
+    .item-header { padding: 6px 8px; color: #aaa; }
+    .item-header a { color: #9abfff; }
+    .viewport { display: grid; place-items: center; aspect-ratio: 16 / 9; overflow: hidden; background: #181818; color: #aaa; }
+    .viewport.ready { display: block; }
+    iframe { display: block; width: 100%; height: 100%; border: 0; background: #181818; }
+    footer { margin-top: 24px; color: #aaa; }
+    @media (max-width: 480px) { .form { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <h1>Open a gallery</h1>
+      <p>
+        Enter URLs or paste HTML / BBCode. Image indices increase in the order the URLs appear.
+        Use direct URLs to the original encoded .png files, not hosting pages, thumbnails, or resized copies,
+        so images can load, decode, and display correctly.
+      </p>
+    </header>
+
+    <section class="form" aria-label="Gallery settings">
+      <label>PNG URLs
+        <textarea
+          id="urls"
+          spellcheck="false"
+          placeholder="https://example.com/first.vnd-0.png&#10;https://example.com/second.vnd-1.png"
+        ></textarea>
+      </label>
+      <div class="side">
+        <label>Input mode
+          <select id="mode">
+            <option value="lines">One URL per line</option>
+            <option value="extract">Extract PNG URLs</option>
+          </select>
+        </label>
+        <label>Seed phrase
+          <input id="seed" autocomplete="off" spellcheck="false">
+        </label>
+        <label>First index
+          <input id="start" type="number" min="0" value="0">
+        </label>
+        <button id="open" type="button">Show</button>
+      </div>
+    </section>
+
+    <p id="status" class="status" aria-live="polite"></p>
+    <section id="gallery" class="gallery" aria-label="Decoded images"></section>
+    <footer>
+      © 2026 Keishin Senzaki (reordo) ·
+      <a href="mailto:riodaa@proton.me">riodaa@proton.me</a> ·
+      <a href="https://github.com/reordo">GitHub</a> ·
+      <a href="https://github.com/reordo/VisualNoiseDecoder">Repository</a>
+    </footer>
+  </main>
+
+  <script>
+    const $ = selector => document.querySelector(selector);
+    const urls = $('#urls');
+    const mode = $('#mode');
+    const seed = $('#seed');
+    const start = $('#start');
+    const status = $('#status');
+    const gallery = $('#gallery');
+    const pendingFrames = new WeakMap();
+    let observer;
+
+    function fit(frame, width, height) {
+      const viewport = frame.parentElement;
+      viewport.style.aspectRatio = 'auto';
+      const scale = Math.min(1, viewport.clientWidth / width);
+      frame.dataset.width = width;
+      frame.dataset.height = height;
+      viewport.style.height = `${Math.ceil(height * scale)}px`;
+    }
+
+    function mount(item) {
+      const viewport = item.querySelector('.viewport');
+      const frame = pendingFrames.get(item);
+      if (!frame || frame.isConnected) return;
+
+      frame.src = frame.dataset.src;
+      viewport.replaceChildren(frame);
+      viewport.classList.add('ready');
+      observer?.unobserve(item);
+    }
+
+    function observeItems() {
+      observer?.disconnect();
+      const items = gallery.querySelectorAll('.item');
+
+      if (!window.IntersectionObserver) {
+        items.forEach(mount);
+        return;
+      }
+      observer = new IntersectionObserver(
+        entries => entries.forEach(entry => {
+          if (entry.isIntersecting) mount(entry.target);
+        }),
+        { rootMargin: '100px 0px' }
+      );
+      items.forEach(item => observer.observe(item));
+    }
+
+    function createItem(source, index) {
+      const previewSource = location.hostname === 'htmlpreview.github.io' &&
+        location.search.startsWith('?https://github.com/');
+      const imagePage = previewSource
+        ? `${location.origin}/?${new URL('image.html', location.search.slice(1)).href}`
+        : 'image.html';
+      const viewer = new URL(imagePage, location.href);
+      viewer.hash = new URLSearchParams({ url: source, seed: seed.value, index });
+
+      const item = document.createElement('article');
+      const header = document.createElement('div');
+      const title = document.createElement('span');
+      const link = document.createElement('a');
+      const viewport = document.createElement('div');
+      const frame = document.createElement('iframe');
+
+      item.className = 'item';
+      header.className = 'item-header';
+      title.textContent = `image ${index}`;
+      link.href = viewer.href;
+      link.textContent = 'open separately';
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      header.append(title, ' · ', link);
+      viewport.className = 'viewport';
+      viewport.textContent = 'Loads when scrolled into view';
+      frame.title = `Decoded image ${index}`;
+      frame.dataset.index = index;
+      frame.loading = 'lazy';
+      frame.dataset.src = viewer.href;
+      pendingFrames.set(item, frame);
+      item.append(header, viewport);
+      return item;
+    }
+
+    function openGallery(updateHash = true) {
+      const firstIndexText = start.value.trim();
+      const firstIndex = Number(firstIndexText);
+      const lines = mode.value === 'extract'
+        ? (urls.value.match(/https?:\/\/[^\s<>"'\[\]]+?\.png(?:[?#][^\s<>"'\[\]]*)?(?=$|[\s<>"'\[\]])/gi) || [])
+          .map(value => value.replace(/&amp;/gi, '&'))
+        : urls.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+
+      if (
+        !seed.value ||
+        !lines.length ||
+        !firstIndexText ||
+        !Number.isSafeInteger(firstIndex) ||
+        firstIndex < 0
+      ) {
+        status.textContent = 'Enter at least one URL (a PNG URL in extract mode), a seed phrase, and a valid first index.';
+        return;
+      }
+
+      const output = document.createDocumentFragment();
+      let invalid = 0;
+      lines.forEach((value, offset) => {
+        try {
+          output.append(createItem(new URL(value, location.href).href, firstIndex + offset));
+        } catch {
+          invalid++;
+        }
+      });
+
+      gallery.replaceChildren(output);
+      status.textContent = invalid ? `${invalid} invalid URL${invalid === 1 ? '' : 's'} skipped.` : '';
+      if (updateHash) {
+        const params = new URLSearchParams();
+        params.set('mode', mode.value);
+        if (mode.value === 'extract') params.set('urls', urls.value);
+        else lines.forEach(url => params.append('url', url));
+        params.set('seed', seed.value);
+        params.set('index', firstIndex);
+        history.replaceState(null, '', `${location.href.split('#')[0]}#${params}`);
+      }
+      observeItems();
+    }
+
+    function openFromHash() {
+      const params = new URLSearchParams(location.hash.slice(1));
+      const links = params.getAll('url');
+      if (!links.length && !params.has('urls')) return;
+      urls.value = params.has('urls') ? params.get('urls') : links.join('\n');
+      mode.value = params.get('mode') === 'extract' ? 'extract' : 'lines';
+      seed.value = params.get('seed') || '';
+      start.value = params.get('index') ?? '0';
+      openGallery(false);
+    }
+
+    $('#open').addEventListener('click', () => openGallery());
+    window.addEventListener('hashchange', openFromHash);
+    openFromHash();
+    for (const node of [urls, mode, seed, start]) {
+      node.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && event.ctrlKey) openGallery();
+      });
+    }
+
+    window.addEventListener('message', event => {
+      const { data } = event;
+      if (
+        data?.type !== 'vnd-image-size' ||
+        !Number.isFinite(data.width) ||
+        !Number.isFinite(data.height) ||
+        data.width <= 0 ||
+        data.height <= 0
+      ) return;
+
+      const frame = [...gallery.querySelectorAll('iframe')]
+        .find(candidate => candidate.contentWindow === event.source);
+      if (frame) {
+        fit(frame, data.width, data.height);
+        frame.closest('.item').querySelector('.item-header span').textContent =
+          `image ${frame.dataset.index}${data.canZoom ? ' · click to zoom' : ''}`;
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      gallery.querySelectorAll('iframe').forEach(frame => {
+        if (frame.dataset.width) {
+          fit(frame, Number(frame.dataset.width), Number(frame.dataset.height));
+        }
+      });
+    });
+  </script>
+</body>
+</html>
